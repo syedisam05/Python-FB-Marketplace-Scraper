@@ -1,0 +1,514 @@
+"""
+Facebook Marketplace Monitor
+Only opens detail pages for listings whose CARD TEXT contains 4090 or 5090.
+Age must be "listed N minutes ago" and within MAX_AGE_MINUTES.
+
+Requirements:
+    pip install playwright requests
+    playwright install chromium
+
+First-time setup:
+    1. Set DISCORD_WEBHOOK_URL below.
+    2. Set FORCE_LOGIN = True, run, log in via the browser, press ENTER.
+    3. Set FORCE_LOGIN = False for all future runs.
+"""
+
+import json
+import random
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# =============================================================================
+# ▼▼▼  EDIT THESE  ▼▼▼
+# =============================================================================
+
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1486575962081722378/A2JxEDhAN_BAaYqsaTLjEG7cRhos62pDAs8P5cV12xoONDUFMc77zSfzib7SMKcG9wQh"
+
+MAX_AGE_MINUTES      = 25
+MIN_INTERVAL_SECONDS = 55
+MAX_INTERVAL_SECONDS = 100
+
+FORCE_LOGIN = False
+HEADLESS    = False
+
+# =============================================================================
+# SEARCH URLS — Milton region ID, 24h filter
+# =============================================================================
+
+SEARCHES = [
+    "https://www.facebook.com/marketplace/109493702409366/search?daysSinceListed=1&query=4090&exact=false",
+    "https://www.facebook.com/marketplace/109493702409366/search?daysSinceListed=1&query=rtx%204090&exact=false",
+    "https://www.facebook.com/marketplace/109493702409366/search?daysSinceListed=1&query=5090&exact=false",
+    "https://www.facebook.com/marketplace/109493702409366/search?daysSinceListed=1&query=rtx%205090&exact=false",
+]
+
+# =============================================================================
+# INTERNALS
+# =============================================================================
+
+SCROLL_PASSES      = 10          # 5 scrolls per search page as requested
+MAX_CARDS_PER_PAGE = 200
+DETAIL_WAIT_MS     = 1400
+
+LOG_FILE   = Path("marketplace_monitor.log")
+SEEN_FILE  = Path("seen.json")
+STATE_FILE = Path("facebook_state.json")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+# ---------------------------------------------------------------------------
+# GPU keyword pattern
+# Matches: 4090, rtx4090, rtx 4090, 5090, rtx5090, rtx 5090
+# Does NOT match: 6430-5090, 9800X3D, 5080, etc.
+# ---------------------------------------------------------------------------
+
+_GPU_KW_RE = re.compile(
+    r"(?<![a-z0-9\-])(?:rtx\s*)?(?:4090|5090)(?![a-z0-9])",
+    re.I,
+)
+
+
+def find_gpu_keyword(text: str) -> str:
+    """
+    Returns matched keyword if text contains 4090/5090 as a GPU model.
+    Rejects digit-hyphen prefixes like '6430-5090'.
+    Returns '' if no valid GPU keyword found.
+    """
+    for m in _GPU_KW_RE.finditer(text):
+        prefix = text[max(0, m.start() - 6):m.start()]
+        if re.search(r'\d-\s*$', prefix):
+            continue  # "6430-5090" — skip
+        return m.group(0).lower().replace(' ', '')
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Age parsing — ONLY "listed N minutes ago" or "N minutes ago"
+# Everything else (just listed, hours, days, weeks) → None → rejected
+# ---------------------------------------------------------------------------
+
+_AGE_RE = re.compile(
+    r"listed\s+(\d+)\s*(?:minutes?|mins?)\s+ago"
+    r"|(\d+)\s*(?:minutes?|mins?)\s+ago",
+    re.I,
+)
+
+
+def parse_age(text: str) -> Optional[int]:
+    if not text:
+        return None
+    m = _AGE_RE.search(text)
+    if not m:
+        return None
+    val = m.group(1) or m.group(2)
+    return int(val) if val else None
+
+
+def age_ok(age: Optional[int]) -> bool:
+    return age is not None and age <= MAX_AGE_MINUTES
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Listing:
+    listing_id:   str
+    title:        str
+    price:        str
+    location:     str
+    url:          str
+    keyword:      str
+    found_at:     str
+    age_minutes:  int
+    recency_text: str
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg: str) -> None:
+    line = f"[{_now()}] {msg}"
+    print(line, flush=True)
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def load_seen() -> set[str]:
+    if not SEEN_FILE.exists():
+        return set()
+    try:
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        return set(data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def save_seen(seen: set[str]) -> None:
+    SEEN_FILE.write_text(json.dumps(sorted(seen), indent=2), encoding="utf-8")
+
+
+def extract_id(url: str) -> Optional[str]:
+    m = re.search(r"/(?:marketplace/item|item)/(\d+)", url)
+    return m.group(1) if m else None
+
+
+def normalise_url(href: str) -> str:
+    return "https://www.facebook.com" + href if href.startswith("/") else href
+
+
+# ---------------------------------------------------------------------------
+# Discord
+# ---------------------------------------------------------------------------
+
+def send_discord(listing: Listing) -> None:
+    content = (
+        f"🚨 **New RTX Listing**\n"
+        f"**Keyword:** `{listing.keyword}`\n"
+        f"**Title:** {listing.title}\n"
+        f"**Price:** {listing.price or 'N/A'}\n"
+        f"**Location:** {listing.location or 'N/A'}\n"
+        f"**Listed:** {listing.recency_text}\n"
+        f"**Link:** {listing.url}"
+    )
+    r = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=15)
+    r.raise_for_status()
+
+
+def notify(listing: Listing) -> None:
+    try:
+        send_discord(listing)
+        log(f"  ✅ Discord sent — {listing.listing_id}")
+    except Exception as e:
+        log(f"  ⚠️  Discord error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
+
+def _card_text(link_loc) -> str:
+    """Grab card text by walking up the DOM from the <a> tag."""
+    for n in range(1, 8):
+        try:
+            txt = link_loc.locator(f"xpath=ancestor::div[{n}]").inner_text(timeout=600).strip()
+            if txt and len(txt) > 5:
+                return txt
+        except Exception:
+            continue
+    return ""
+
+
+def scrape_search_page(page, url: str) -> list[tuple[str, str, str]]:
+    """
+    Load page, do SCROLL_PASSES scrolls, collect cards.
+
+    A card is only kept if:
+      1. The card text contains '4090' or '5090' as a GPU keyword
+      2. The card age (if readable) is within MAX_AGE_MINUTES
+
+    Returns list of (lid, full_url, matched_keyword).
+    Detail pages are only opened for these — nothing else.
+    """
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=55_000)
+        page.wait_for_timeout(2000)
+    except PlaywrightTimeoutError:
+        log(f"  ⚠️  Timeout: {url[:80]}")
+        return []
+    except Exception as e:
+        log(f"  ⚠️  Load error: {e}")
+        return []
+
+    seen_on_page: set[str] = set()
+    results: list[tuple[str, str, str]] = []
+
+    for _ in range(SCROLL_PASSES):
+        try:
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(500)
+        except Exception:
+            break
+
+    # Collect all links after scrolling
+    links = page.locator("a[href*='/marketplace/item/'], a[href*='/item/']")
+    count = min(links.count(), MAX_CARDS_PER_PAGE)
+
+    for i in range(count):
+        try:
+            link = links.nth(i)
+            href = link.get_attribute("href", timeout=600)
+            if not href:
+                continue
+            full_url = normalise_url(href)
+            lid = extract_id(full_url)
+            if not lid or lid in seen_on_page:
+                continue
+            seen_on_page.add(lid)
+
+            card = _card_text(link)
+
+            # GATE 1: card text must contain 4090 or 5090 as a GPU keyword
+            # Cards with titles like "RTX 5080", "Ryzen 9800X3D", etc. are dropped here
+            kw = find_gpu_keyword(card)
+            if not kw:
+                continue
+
+            # GATE 2: if card shows a parseable minute age that's already too old, skip
+            card_age = parse_age(card)
+            if card_age is not None and not age_ok(card_age):
+                continue
+
+            results.append((lid, full_url, kw))
+        except Exception:
+            continue
+
+    log(f"  {url.split('query=')[1].split('&')[0]!r} → {len(results)} GPU-keyword card(s) from {count} total")
+    return results
+
+
+def extract_detail(page, url: str) -> Optional[dict]:
+    """Open detail page, extract title (from page <title>), price, location, age."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=55_000)
+        page.wait_for_timeout(DETAIL_WAIT_MS)
+    except Exception:
+        return None
+
+    # Title from page <title> tag — most reliable
+    title = ""
+    try:
+        raw = page.title()
+        title = raw.split("|")[0].split(" - ")[0].strip()
+        if title.lower() in ("facebook", "marketplace", "facebook marketplace", ""):
+            title = ""
+    except Exception:
+        pass
+
+    try:
+        body = page.locator("body").inner_text(timeout=5000).strip()
+    except Exception:
+        return None
+
+    if not body:
+        return None
+
+    lines = [l.strip() for l in body.splitlines() if l.strip()]
+    price_re = re.compile(r"(CA\$|C\$|\$)\s?[\d,]+", re.I)
+    noise = {
+        "facebook", "marketplace", "facebook marketplace",
+        "message seller", "message", "save", "share", "like", "comment",
+        "details", "description", "condition", "brand", "public meetup",
+        "tags", "send seller a message", "new", "used", "used - like new",
+        "used - good", "used - fair", "as is",
+    }
+
+    price = location = recency_text = ""
+
+    for line in lines[:60]:
+        low = line.lower().strip()
+
+        if not price and price_re.search(line):
+            price = line
+
+        if not recency_text and parse_age(line) is not None:
+            recency_text = line
+
+        if (
+            not title
+            and low not in noise
+            and not price_re.search(line)
+            and parse_age(line) is None
+            and len(line) >= 6
+            and not re.match(r"^(listed|send|just|condition|brand|tags|details)", low)
+        ):
+            title = line
+
+        if not location and re.search(r",\s*(ON|Ontario)\b", line, re.I):
+            location = line[:150]
+
+        if title and price and location and recency_text:
+            break
+
+    # Fallback: scan full body for age
+    if not recency_text:
+        m = _AGE_RE.search(body)
+        if m:
+            start = max(0, m.start() - 8)
+            end   = min(len(body), m.end() + 30)
+            recency_text = body[start:end].strip()
+
+    return {
+        "title":        title[:300],
+        "price":        price[:100],
+        "location":     location,
+        "recency_text": recency_text[:120],
+        "age_minutes":  parse_age(recency_text or body[:800]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scan cycle
+# ---------------------------------------------------------------------------
+
+def scan_once(context, seen: set[str]) -> set[str]:
+    # lid → (url, card_keyword)
+    all_candidates: dict[str, tuple[str, str]] = {}
+
+    search_page = context.new_page()
+    try:
+        for url in SEARCHES:
+            try:
+                for lid, full_url, kw in scrape_search_page(search_page, url):
+                    if lid not in all_candidates:
+                        all_candidates[lid] = (full_url, kw)
+            except Exception as e:
+                log(f"  ⚠️  Scrape error: {e}")
+    finally:
+        search_page.close()
+
+    log(f"Cards with 4090/5090 in text: {len(all_candidates)}")
+
+    # Bootstrap first run
+    if not seen and all_candidates:
+        seen.update(all_candidates.keys())
+        save_seen(seen)
+        log(f"First-run bootstrap: {len(seen)} listings marked seen. No alerts this cycle.")
+        return seen
+
+    new_lids = [lid for lid in all_candidates if lid not in seen]
+    log(f"New (unseen): {len(new_lids)}")
+
+    if not new_lids:
+        return seen
+
+    # Mark seen immediately (crash-safe)
+    for lid in new_lids:
+        seen.add(lid)
+
+    alerts = 0
+    detail_page = context.new_page()
+    try:
+        for lid in new_lids:
+            url, card_kw = all_candidates[lid]
+
+            detail = extract_detail(detail_page, url)
+            if not detail:
+                continue
+
+            title = detail["title"]
+
+            # Confirm keyword is still in the full title (not just card snippet)
+            confirmed_kw = find_gpu_keyword(title) or card_kw
+
+            # Age must be "listed N minutes ago" and within limit
+            age = detail["age_minutes"]
+            if not age_ok(age):
+                log(f"  Skip {lid} — '{detail['recency_text'][:50]}' (age={age})")
+                continue
+
+            listing = Listing(
+                listing_id=lid,
+                title=title or f"(id: {lid})",
+                price=detail["price"],
+                location=detail["location"],
+                url=url,
+                keyword=confirmed_kw,
+                found_at=_now(),
+                age_minutes=age,
+                recency_text=detail["recency_text"],
+            )
+            log(f"  🔔 ALERT: '{listing.title}' | {listing.price} | {listing.recency_text}")
+            notify(listing)
+            alerts += 1
+            time.sleep(0.3)
+    finally:
+        detail_page.close()
+
+    save_seen(seen)
+    log(f"Cycle done — GPU cards: {len(all_candidates)} | new: {len(new_lids)} | alerts: {alerts}")
+    return seen
+
+
+# ---------------------------------------------------------------------------
+# Login / entry point
+# ---------------------------------------------------------------------------
+
+def do_login(context) -> None:
+    page = context.new_page()
+    try:
+        page.goto("https://www.facebook.com/marketplace/", wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(3000)
+        if "log in" in page.content().lower() or FORCE_LOGIN:
+            log("👤 Log into Facebook in the browser, then press ENTER here.")
+            input()
+        context.storage_state(path=str(STATE_FILE))
+        log(f"Session saved → {STATE_FILE}")
+    finally:
+        page.close()
+
+
+def validate() -> None:
+    if not DISCORD_WEBHOOK_URL.startswith("http"):
+        raise SystemExit("❌  Set DISCORD_WEBHOOK_URL to your real Discord webhook URL.")
+
+
+def main() -> None:
+    validate()
+    seen = load_seen()
+    log(f"Loaded {len(seen)} seen listings.")
+    log(f"URLs: {len(SEARCHES)} | Max age: {MAX_AGE_MINUTES} min | Scrolls/page: {SCROLL_PASSES}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        ctx_kwargs = dict(user_agent=USER_AGENT, viewport={"width": 1440, "height": 1080})
+
+        if STATE_FILE.exists() and not FORCE_LOGIN:
+            context = browser.new_context(storage_state=str(STATE_FILE), **ctx_kwargs)
+        else:
+            context = browser.new_context(**ctx_kwargs)
+            do_login(context)
+
+        try:
+            while True:
+                log("=" * 65)
+                log("Starting scan cycle …")
+                try:
+                    seen = scan_once(context, seen)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    log(f"⚠️  Unexpected error: {e}")
+
+                sleep_sec = random.randint(MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS)
+                log(f"Sleeping {round(sleep_sec / 60, 1)} min …")
+                time.sleep(sleep_sec)
+
+        except KeyboardInterrupt:
+            log("Stopped.")
+        finally:
+            try:
+                context.storage_state(path=str(STATE_FILE))
+            except Exception:
+                pass
+            browser.close()
+
+
+if __name__ == "__main__":
+    main()
